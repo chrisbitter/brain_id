@@ -4,5 +4,15 @@ ruff
 pyriemann
 numpy
 pandas
-scikit-learn
+matplotlib
+scipy
+ipykernel
+jinja2
+pygame
+scikit-learn>=1.6,<1.7
+hypernets>=0.3.0
+prophet>=1.0.1
+statsmodels>=0.12.1
+numba
+git+https://github.com/DataCanvasIO/HyperTS.git
 -e .
