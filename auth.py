@@ -171,6 +171,32 @@ def verify_multi(potatoes: dict, csv_per_rate: dict,
     return ("ACCEPT" if ok else "REJECT"), results
 
 
+# ── enrollment from array (for split-testing) ─────────────────────────────────
+
+def enroll_from_array(X: np.ndarray, z_threshold: float = Z_THRESHOLD) -> Potato:
+    """Fit a Potato from an already-loaded (n_channels, n_samples) array."""
+    covs = to_covs(epoch(preprocess(X)))
+    print(f"  enrollment: {len(covs)} clean epochs")
+    potato = Potato(metric="riemann", threshold=z_threshold)
+    potato.fit(covs)
+    return potato
+
+
+def verify_from_array(potato: Potato, X: np.ndarray,
+                      accept_majority: float = ACCEPT_MAJORITY) -> dict:
+    """Verify against an already-loaded (n_channels, n_samples) array."""
+    covs = to_covs(epoch(preprocess(X)))
+    labels = potato.predict(covs)
+    zscores = potato.transform(covs)
+    accept_rate = float(labels.mean())
+    return {
+        "decision": "ACCEPT" if accept_rate > accept_majority else "REJECT",
+        "accept_rate": round(accept_rate, 3),
+        "mean_zscore": round(float(zscores.mean()), 3),
+        "n_epochs": len(covs),
+    }
+
+
 # ── persistence ───────────────────────────────────────────────────────────────
 
 def save_potatoes(potatoes: dict, path: str) -> None:
@@ -187,23 +213,41 @@ def load_potatoes(path: str) -> dict:
 # ── example / quick-start ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── split-test: enroll on first half, verify on held-out second half ──────
+    print("=== Split-test: ziyang first-half enroll / second-half verify ===")
+    X_full = load_csv("data/raw/1230_ziyang_5hz.csv")
+    mid = X_full.shape[1] // 2
+    X_enroll, X_verify = X_full[:, :mid], X_full[:, mid:]
+
+    potato_split = enroll_from_array(X_enroll)
+    r_self  = verify_from_array(potato_split, X_verify)
+    r_chris = verify_from_array(potato_split, load_csv("data/raw/1230_chris_5hz.csv"))
+    print(f"  ziyang held-out half : {r_self}")
+    print(f"  chris impostor       : {r_chris}")
+
+    # ── full enrollment on all ziyang data ────────────────────────────────────
+    print()
     ENROLL_CSVS = {
         "5hz":  "data/raw/1230_ziyang_5hz.csv",
-        "10hz": "data/raw/1230_ziyang_10hz.csv",
-        "15hz": "data/raw/1230_ziyang_15hz.csv",
+        # "10hz": "data/raw/1230_ziyang_10hz.csv",
+        # "15hz": "data/raw/1230_ziyang_15hz.csv",
     }
 
-    print("=== Enrollment ===")
+    print("=== Full enrollment (ziyang) ===")
     potatoes = enroll_multi(ENROLL_CSVS)
     save_potatoes(potatoes, "models/ziyang_potatoes.pkl")
 
-    print("\n=== Self-test (should ACCEPT) ===")
+    print("\n=== Self-test on training data (upper bound) ===")
     decision, results = verify_multi(potatoes, ENROLL_CSVS)
     print(f"Decision: {decision}")
     for rate, r in results.items():
         print(f"  {rate}: {r}")
 
-    # When impostor data is available:
-    IMPOSTOR_CSVS = {'5hz': '...', '10hz': '...', '15hz': '...'}
+    print("\n=== Impostor: chris (should REJECT) ===")
+    IMPOSTOR_CSVS = {
+        "5hz": "data/raw/1230_chris_5hz.csv",
+    }
     decision, results = verify_multi(potatoes, IMPOSTOR_CSVS)
-    print(f"Impostor decision: {decision}")  # should be REJECT
+    print(f"Decision: {decision}")
+    for rate, r in results.items():
+        print(f"  {rate}: {r}")
