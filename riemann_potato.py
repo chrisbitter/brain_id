@@ -5,10 +5,21 @@ Pipeline:
   1. Load CSV        (Unicorn export: 'EEG 1' … 'EEG 8', values in nV)
   2. Channel select  (keep occipital/parietal: Pz, PO7, Oz, PO8 = ch5–ch8)
   3. Preprocess      notch 50 Hz → narrow bandpass ±2 Hz around SSVEP freq → CAR
-  4. Epoch           2-second windows, 50 % overlap, artifact rejection
-  5. Covariance      OAS shrinkage → trace-normalise
-  6. enroll()        fit Potato per person per flickering rate
-  7. verify()        accept if > 50 % of epochs are inliers
+  4. Downsample      250 Hz → 100 Hz (sufficient for 5–15 Hz SSVEP; better cov. conditioning)
+  5. Epoch           2-second windows, 50 % overlap, artifact rejection
+  6. Covariance      OAS shrinkage → trace-normalise
+  7. enroll()        fit Potato per person per flickering rate
+  8. verify()        accept if > 50 % of epochs are inliers
+
+Reference for preprocessing choices
+-------------------------------------
+Stieger et al., "Biosensors" 2021, 11, 404 — motor imagery on Unicorn Hybrid Black:
+  - 4th-order Butterworth bandpass 1–30 Hz on same device/electrode layout
+  - Downsample to 100 Hz post-filter
+  - Electrode map (Fig. 2): Fz, C3, Cz, C4, Pz, PO7, Oz, PO8 (confirms our OCC_CHANNELS)
+We adopt 1 Hz lower cutoff and 100 Hz resampling for the broadband fallback.
+Narrow SSVEP bandpass (±2 Hz around stimulus) supersedes the broadband filter when
+a stimulus frequency is known.
 
 Data units: raw Unicorn CSV is in nV. Artifact threshold is therefore in nV too.
 
@@ -27,15 +38,18 @@ import numpy as np
 import pandas as pd
 from pyriemann.clustering import Potato
 from pyriemann.estimation import Covariances
-from scipy.signal import butter, detrend, filtfilt, iirnotch
+from scipy.signal import butter, detrend, filtfilt, iirnotch, resample
 
 # ── configuration ────────────────────────────────────────────────────────────
 
-SFREQ        = 250            # Unicorn sampling rate (Hz)
+SFREQ        = 250            # Unicorn acquisition rate (Hz)
+SFREQ_DS     = 100            # downsample target (Hz); paper: 250→100 on same device
+                              # sufficient for 5–15 Hz SSVEP (Nyquist=50 Hz);
+                              # smaller epochs (200 vs 500 samples) → better OAS conditioning
 N_CHANNELS   = 8
 NOTCH_HZ     = 50.0           # power-line noise
 NARROW_BW    = 2.0            # ± Hz around SSVEP frequency for narrow bandpass
-BANDPASS_HZ  = (5.0, 40.0)   # fallback broadband (used when ssvep_freq=None)
+BANDPASS_HZ  = (1.0, 30.0)   # broadband fallback — paper uses 1–30 Hz on Unicorn
 EPOCH_SEC    = 2.0
 OVERLAP      = 0.5            # 50 % → step = 1 s
 Z_THRESHOLD  = 2.5
@@ -75,19 +89,19 @@ def load_csv(path: str, channels: list = None) -> np.ndarray:
 
 # ── preprocessing ─────────────────────────────────────────────────────────────
 
-def preprocess(X: np.ndarray, ssvep_freq: float = None, sfreq: float = SFREQ) -> np.ndarray:
-    """Notch → bandpass → CAR.
+def preprocess(X: np.ndarray, ssvep_freq: float = None,
+               sfreq: float = SFREQ, target_sfreq: float = SFREQ_DS) -> np.ndarray:
+    """Notch → bandpass → downsample → CAR.
 
-    Args:
-        ssvep_freq: if given, apply narrow bandpass (±NARROW_BW Hz) around this
-                    frequency instead of the broadband fallback.
-                    Pass RATE_TO_FREQ[rate] when processing SSVEP data.
+    Follows Biosensors 2021, 11, 404 (same Unicorn device):
+      bandpass 1–30 Hz, then 250→100 Hz downsample.
+    When ssvep_freq is given, narrow ±2 Hz bandpass replaces broadband.
     """
-    # 1. Notch at 50 Hz
+    # 1. Notch 50 Hz
     b, a = iirnotch(NOTCH_HZ, Q=30, fs=sfreq)
     X = filtfilt(b, a, X, axis=1)
 
-    # 2. Bandpass
+    # 2. Bandpass (doubles as anti-alias filter before downsampling)
     if ssvep_freq is not None:
         lo = max(0.5, ssvep_freq - NARROW_BW) / (sfreq / 2)
         hi = min(sfreq / 2 - 1, ssvep_freq + NARROW_BW) / (sfreq / 2)
@@ -97,17 +111,20 @@ def preprocess(X: np.ndarray, ssvep_freq: float = None, sfreq: float = SFREQ) ->
     b, a = butter(4, [lo, hi], btype="band")
     X = filtfilt(b, a, X, axis=1)
 
-    # 3. CAR: subtract instantaneous mean across channels
-    #    removes global amplitude shifts that vary session-to-session
-    X = X - X.mean(axis=0, keepdims=True)
+    # 3. Downsample 250 → 100 Hz
+    if target_sfreq != sfreq:
+        n_out = int(X.shape[1] * target_sfreq / sfreq)
+        X = resample(X, n_out, axis=1)
 
+    # 4. CAR
+    X = X - X.mean(axis=0, keepdims=True)
     return X
 
 
 # ── epoching ──────────────────────────────────────────────────────────────────
 
 def epoch(X: np.ndarray, sec: float = EPOCH_SEC, overlap: float = OVERLAP,
-          sfreq: float = SFREQ) -> np.ndarray:
+          sfreq: float = SFREQ_DS) -> np.ndarray:
     """Continuous (n_channels, n_samples) → (n_epochs, n_channels, n_times).
 
     Detrends each epoch (removes linear drift within window) and rejects
