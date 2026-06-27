@@ -1,4 +1,8 @@
 pip
 python-dotenv
 ruff
+pyriemann
+numpy
+pandas
+scikit-learn
 -e .
